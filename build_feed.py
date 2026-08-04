@@ -50,32 +50,36 @@ def _api_key() -> str:
     return key
 
 
-def signed_url(api_key: str, yymmdd: str) -> str:
-    req = urllib.request.Request(
-        FILE_API.format(yymmdd=yymmdd), headers={"X-API-KEY": api_key}
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = json.load(resp)
-    match = re.search(r"https://\S+", str(body))
-    if not match:
-        raise RuntimeError(f"no redirect URL in file response for {yymmdd}")
-    # The URL is embedded in prose; a sentence period can trail the last param.
-    return match.group(0).rstrip(".")
-
-
 def download_file(api_key: str, file_date: date, cache_dir: Path) -> Path:
+    """Fetch one daily zip. The ODP file endpoint either streams the zip
+    directly (observed with urllib) or returns a prose note containing a
+    signed redirect URL (observed with curl) — sniff and handle both."""
     yymmdd = file_date.strftime("%y%m%d")
     dest = cache_dir / f"apc{yymmdd}.zip"
     if dest.exists() and zipfile.is_zipfile(dest):
         return dest
-    url = signed_url(api_key, yymmdd)
+    req = urllib.request.Request(
+        FILE_API.format(yymmdd=yymmdd), headers={"X-API-KEY": api_key}
+    )
     tmp = dest.with_suffix(".part")
-    urllib.request.urlretrieve(url, tmp)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        head = resp.read(4)
+        if head[:2] == b"PK":
+            with open(tmp, "wb") as out:
+                out.write(head)
+                while chunk := resp.read(1 << 20):
+                    out.write(chunk)
+        else:
+            note = (head + resp.read()).decode("utf-8", errors="replace")
+            match = re.search(r"https://\S+", note)
+            if not match:
+                raise RuntimeError(f"no zip and no redirect URL for {yymmdd}")
+            # The URL is embedded in prose; a sentence period can trail the
+            # final Key-Pair-Id parameter and corrupt the signature.
+            urllib.request.urlretrieve(match.group(0).rstrip("."), tmp)
     if not zipfile.is_zipfile(tmp):
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"download for {yymmdd} was not a zip (signed URL likely rejected)"
-        )
+        raise RuntimeError(f"download for {yymmdd} was not a valid zip")
     tmp.replace(dest)
     return dest
 
